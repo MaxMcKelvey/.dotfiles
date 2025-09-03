@@ -82,6 +82,8 @@ alias vim='nvim'
 alias n='nvim'
 alias c='clear'
 
+bindkey '^f' autosuggest-accept
+
 # Shell integrations
-# eval "$(fzf --zsh)" # enable for new versions of fzf
+eval "$(fzf --zsh)" # enable for new versions of fzf
 eval "$(zoxide init --cmd cd zsh)"
