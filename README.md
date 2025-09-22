@@ -56,6 +56,68 @@ CapsLock:: {
     else
         Send("{Escape}")    ; Otherwise, send Escape
 }
+
+
+
+; Remap Copilot key (F23 / sc06E) to Left Ctrl
+sc06E::Ctrl
+
+
+; Alt + `  → next window of the same app
+!`::CycleAppWindow(1)
+; Alt + Shift + `  → previous window of the same app
++!`::CycleAppWindow(-1)
+
+CycleAppWindow(dir := 1) {
+    active := WinExist("A")
+    if !active
+        return
+
+    exe := WinGetProcessName("ahk_id " active)
+    if !exe
+        return
+
+    DetectHiddenWindows false
+
+    ; Collect all visible, non-tool windows for the same executable
+    wins := WinGetList("ahk_exe " exe)
+    filtered := []
+    for hwnd in wins {
+        style := WinGetStyle("ahk_id " hwnd)        ; WS_VISIBLE = 0x10000000
+        ex    := WinGetExStyle("ahk_id " hwnd)      ; WS_EX_TOOLWINDOW = 0x00000080
+        if !(style & 0x10000000)            ; not visible
+            continue
+        if (ex & 0x00000080)                ; skip tool/utility windows
+            continue
+        filtered.Push(hwnd)
+    }
+
+    if filtered.Length <= 1
+        return
+
+    ; Find current window index in the filtered list
+    idx := 0
+    for i, hwnd in filtered {
+        if (hwnd = active) {
+            idx := i
+            break
+        }
+    }
+    if (idx = 0)
+        idx := 1
+
+    ; Compute next/previous index (wrap around)
+    nextIdx := (dir > 0) ? (idx + 1) : (idx - 1)
+    if (nextIdx > filtered.Length)
+        nextIdx := 1
+    if (nextIdx < 1)
+        nextIdx := filtered.Length
+
+    target := filtered[nextIdx]
+    if (WinGetMinMax("ahk_id " target) = -1)  ; if minimized, restore first
+        WinRestore "ahk_id " target
+    WinActivate "ahk_id " target
+}
 ```
 
 Double click to run!
