@@ -18,6 +18,27 @@
 4. `:q` and `n .` to reopen neovim
 5. `:PackerSync` to install packages with packer
 
+### Work Config
+
+Create the file `.config/nvim/lua/work-config.lua`
+
+Currently supported options:
+
+```lua
+NO_TREESITTER = true -- disables treesitter for your user (good if you can't download lsps)
+```
+
+And then add whatever else you'd like!
+
+### GitHub Copilot
+
+```
+git clone --depth=1 https://github.com/github/copilot.vim.git \
+  ~/.config/nvim/pack/github/start/copilot.vim
+```
+
+Start Neovim and invoke `:Copilot setup`
+
 ## Instructions for tmux
 
 1. `ln -s ~/.dotfiles/.tmux.conf ~/.tmux.conf`

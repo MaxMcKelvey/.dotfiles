@@ -1,3 +1,5 @@
+if NO_TREESITTER then return end
+
 require'nvim-treesitter.configs'.setup {
     -- A list of parser names, or "all"
     ensure_installed = { "javascript", "typescript", "c", "lua", "rust", "verilog", "python", "vim", "vimdoc", "typescript", "markdown", "markdown_inline" },

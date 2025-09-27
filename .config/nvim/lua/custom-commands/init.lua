@@ -1,1 +1,1 @@
-require("custom-commands.filterlines").setup()
+require("custom-commands.filterlines").setup({})
