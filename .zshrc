@@ -22,6 +22,9 @@ fi
 # Source/Load zinit
 source "${ZINIT_HOME}/zinit.zsh"
 
+# Load completions
+autoload -Uz compinit && compinit
+
 # Add in Powerlevel10k
 zinit ice depth=1; zinit light romkatv/powerlevel10k
 
@@ -40,9 +43,6 @@ zinit snippet OMZP::aws
 zinit snippet OMZP::kubectl
 zinit snippet OMZP::kubectx
 zinit snippet OMZP::command-not-found
-
-# Load completions
-autoload -Uz compinit && compinit
 
 zinit cdreplay -q
 
@@ -81,8 +81,11 @@ alias ls='ls --color'
 alias vim='nvim'
 alias n='nvim'
 alias c='clear'
+alias ll='ls -la --color'
+alias la='ls -a --color'
 
 bindkey '^f' autosuggest-accept
+bindkey '^I' expand-or-complete # use fzf-tab for tab behavior
 
 # Shell integrations
 eval "$(fzf --zsh)" # enable for new versions of fzf

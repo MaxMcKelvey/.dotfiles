@@ -35,5 +35,13 @@ venv_dir() {
 # Prompt: smart path + venv directory in yellow
 export PS1='\[\e[32m\]$(smart_pwd)\[\e[0m\]\n> '
 
+# Aliases
+alias ls='ls --color'
+alias vim='nvim'
+alias n='nvim'
+alias c='clear'
+alias ll='ls -la --color'
+alias la='ls -a --color'
+
 # Set up fzf key bindings and fuzzy completion
 eval "$(fzf --bash)"
