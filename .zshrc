@@ -83,6 +83,7 @@ alias n='nvim'
 alias c='clear'
 alias ll='ls -la --color'
 alias la='ls -a --color'
+alias git-clean-branches='git branch --merged main | grep -v "\*" | grep -v "main" | xargs -n 1 git branch -d'
 
 bindkey '^f' autosuggest-accept
 bindkey '^I' expand-or-complete # use fzf-tab for tab behavior

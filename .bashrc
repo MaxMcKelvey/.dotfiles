@@ -42,6 +42,7 @@ alias n='nvim'
 alias c='clear'
 alias ll='ls -la --color'
 alias la='ls -a --color'
+alias git-clean-branches='git branch --merged main | grep -v "\*" | grep -v "main" | xargs -n 1 git branch -d'
 
 # Set up fzf key bindings and fuzzy completion
 eval "$(fzf --bash)"
