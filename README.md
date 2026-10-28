@@ -39,6 +39,27 @@ git clone --depth=1 https://github.com/github/copilot.vim.git \
 
 Start Neovim and invoke `:Copilot setup`
 
+## prmon (PR dashboard)
+
+`bin/prmon` is a terminal dashboard for your open GitHub PRs and recently merged ones. It only needs
+Python 3 (standard library) and the GitHub CLI (`gh auth login`). `.zshrc` adds `bin/` to `PATH`.
+
+- Home screen: draft/open, CI running/done, CI failures, merge conflicts, and the review status of
+  reviewers you track per PR (`✓` approved, `✗` changes requested, `…` waiting, `~` commented)
+- `⏎` details, `a` add reviewer(s): requests their review on GitHub and tracks them (tracked
+  reviewers are always a subset of the PR's GitHub reviewers), `x` untrack, `o` open in browser,
+  `y` copy URL, `r` refresh, `q` quit
+- `M` toggles "merge when approved": once every tracked reviewer approves and CI passes, prmon
+  merges (one attempt per head commit). `m` merges now. `T` switches the repo's merge mode:
+  standard (`gh pr merge` with the repo's default method, which joins GitHub's merge queue if
+  required) or mergify (comments `@mergifyio queue`). Mergify repos are detected automatically,
+  and queue status is shown in the merge column
+- `f` reruns failed GitHub Actions jobs on the selected PR (after confirming). `A` toggles
+  auto-rerun (`↻`): while prmon is running, each failed workflow run is retried at most once
+- Options: `--days N` merged window (default 7), `--interval S` auto-refresh (default 60),
+  `--hostname HOST` for GitHub Enterprise (or `GH_HOST`), `--once` plain-text output
+- Tracked reviewers are stored in `~/.config/prmon/reviewers.json`
+
 ## Instructions for tmux
 
 1. `ln -s ~/.dotfiles/.tmux.conf ~/.tmux.conf`

@@ -1,0 +1,1305 @@
+#!/usr/bin/env python3
+"""prmon - terminal dashboard for your GitHub pull requests.
+
+Shows your open PRs (draft/open, CI progress, CI failures, tracked reviewers)
+plus PRs merged recently. Select a PR for details.
+
+Dependencies: Python 3.8+ standard library and the GitHub CLI (`gh`), logged in
+via `gh auth login`. For GitHub Enterprise use --hostname or set GH_HOST.
+
+Tracked reviewers are stored locally in ~/.config/prmon/reviewers.json.
+"""
+
+import argparse
+import base64
+import curses
+import json
+import locale
+import os
+import shutil
+import subprocess
+import sys
+import textwrap
+import threading
+import time
+import webbrowser
+from dataclasses import dataclass, field
+from datetime import datetime, timedelta, timezone
+from typing import Dict, List, Optional, Tuple
+
+CONFIG_DIR = os.path.join(
+    os.environ.get("XDG_CONFIG_HOME") or os.path.expanduser("~/.config"), "prmon"
+)
+REVIEWERS_FILE = os.path.join(CONFIG_DIR, "reviewers.json")
+AUTORERUN_FILE = os.path.join(CONFIG_DIR, "autorerun.json")
+MERGE_FILE = os.path.join(CONFIG_DIR, "merge.json")
+MAX_AUTO_RETRIES = 1  # per failed workflow run
+
+QUERY = """
+fragment PrFields on PullRequest {
+  number title url body isDraft state createdAt updatedAt mergedAt
+  additions deletions changedFiles mergeable reviewDecision
+  headRefName baseRefName headRefOid
+  repository { nameWithOwner viewerDefaultMergeMethod }
+  mergeQueueEntry { state position }
+  reviewRequests(first: 30) {
+    nodes { requestedReviewer { __typename ... on User { login } ... on Team { slug } } }
+  }
+  latestOpinionatedReviews(first: 50) { nodes { state submittedAt author { login } } }
+  latestReviews(first: 50) { nodes { state submittedAt author { login } } }
+  commits(last: 1) {
+    nodes { commit { statusCheckRollup {
+      state
+      contexts(first: 100) {
+        totalCount
+        nodes {
+          __typename
+          ... on CheckRun {
+            name title status conclusion detailsUrl
+            checkSuite { app { slug } workflowRun { databaseId workflow { name } } }
+          }
+          ... on StatusContext { context state targetUrl }
+        }
+      }
+    } } }
+  }
+}
+
+query($open: String!, $merged: String!) {
+  open: search(query: $open, type: ISSUE, first: 50) { nodes { ...PrFields } }
+  merged: search(query: $merged, type: ISSUE, first: 30) { nodes { ...PrFields } }
+}
+"""
+
+FAIL_STATES = {"FAILURE", "TIMED_OUT", "CANCELLED", "ACTION_REQUIRED", "STARTUP_FAILURE", "ERROR"}
+SKIP_STATES = {"SKIPPED", "NEUTRAL", "STALE"}
+PENDING_STATES = {"PENDING", "EXPECTED"}
+
+
+# ---------------------------------------------------------------------------
+# Data model
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class Check:
+    name: str
+    result: str  # pending | pass | fail | skip
+    detail: str
+    url: str
+    run_id: Optional[int] = None  # GitHub Actions workflow run, if any
+    app: str = ""
+    title: str = ""
+
+    @property
+    def is_mergify(self) -> bool:
+        return "mergify" in self.app
+
+
+@dataclass
+class PR:
+    url: str
+    number: int
+    title: str
+    repo: str
+    state: str  # OPEN | MERGED | CLOSED
+    is_draft: bool
+    body: str
+    head: str
+    base: str
+    created_at: str
+    updated_at: str
+    merged_at: Optional[str]
+    additions: int
+    deletions: int
+    changed_files: int
+    mergeable: str
+    review_decision: Optional[str]
+    requested_users: List[str] = field(default_factory=list)
+    requested_teams: List[str] = field(default_factory=list)
+    opinionated: Dict[str, str] = field(default_factory=dict)  # login(lower) -> state
+    latest: Dict[str, str] = field(default_factory=dict)  # login(lower) -> state
+    login_case: Dict[str, str] = field(default_factory=dict)  # lower -> display
+    checks: List[Check] = field(default_factory=list)
+    checks_total: int = 0
+    head_oid: str = ""
+    merge_method: str = "MERGE"  # repo's default for the viewer: MERGE | SQUASH | REBASE
+    merge_queue: Optional[Tuple[str, Optional[int]]] = None  # GitHub merge queue (state, position)
+
+    @property
+    def ci_checks(self) -> List[Check]:
+        """Checks excluding Mergify's own bookkeeping checks."""
+        return [c for c in self.checks if not c.is_mergify]
+
+    @property
+    def mergify_queue(self) -> Optional[Check]:
+        return next((c for c in self.checks if c.is_mergify and "queue" in c.name.lower()), None)
+
+    @property
+    def uses_mergify(self) -> bool:
+        return any(c.is_mergify for c in self.checks)
+
+    @property
+    def short_ref(self) -> str:
+        return f"{self.repo.split('/')[-1]}#{self.number}"
+
+    @property
+    def state_label(self) -> str:
+        if self.state == "OPEN":
+            return "DRAFT" if self.is_draft else "OPEN"
+        return self.state
+
+
+def parse_pr(node: dict) -> PR:
+    pr = PR(
+        url=node["url"],
+        number=node["number"],
+        title=node["title"],
+        repo=node["repository"]["nameWithOwner"],
+        state=node["state"],
+        is_draft=node["isDraft"],
+        body=node.get("body") or "",
+        head=node["headRefName"],
+        base=node["baseRefName"],
+        created_at=node["createdAt"],
+        updated_at=node["updatedAt"],
+        merged_at=node.get("mergedAt"),
+        additions=node["additions"],
+        deletions=node["deletions"],
+        changed_files=node["changedFiles"],
+        mergeable=node.get("mergeable") or "UNKNOWN",
+        review_decision=node.get("reviewDecision"),
+        head_oid=node.get("headRefOid") or "",
+        merge_method=node["repository"].get("viewerDefaultMergeMethod") or "MERGE",
+    )
+    entry = node.get("mergeQueueEntry")
+    if entry:
+        pr.merge_queue = (entry.get("state") or "QUEUED", entry.get("position"))
+
+    for req in (node.get("reviewRequests") or {}).get("nodes") or []:
+        r = req.get("requestedReviewer") or {}
+        if r.get("__typename") == "User":
+            pr.requested_users.append(r["login"])
+            pr.login_case[r["login"].lower()] = r["login"]
+        elif r.get("__typename") == "Team":
+            pr.requested_teams.append(r["slug"])
+
+    for key, target in (("latestOpinionatedReviews", pr.opinionated), ("latestReviews", pr.latest)):
+        for rev in (node.get(key) or {}).get("nodes") or []:
+            author = (rev.get("author") or {}).get("login")
+            if author:
+                target[author.lower()] = rev["state"]
+                pr.login_case[author.lower()] = author
+
+    commits = (node.get("commits") or {}).get("nodes") or []
+    rollup = commits[0]["commit"].get("statusCheckRollup") if commits else None
+    if rollup:
+        contexts = rollup.get("contexts") or {}
+        pr.checks_total = contexts.get("totalCount") or 0
+        for c in contexts.get("nodes") or []:
+            pr.checks.append(parse_check(c))
+    return pr
+
+
+def parse_check(c: dict) -> Check:
+    if c.get("__typename") == "CheckRun":
+        run = (c.get("checkSuite") or {}).get("workflowRun") or {}
+        workflow = (run.get("workflow") or {}).get("name")
+        name = f"{workflow} / {c['name']}" if workflow else c["name"]
+        url = c.get("detailsUrl") or ""
+        run_id = run.get("databaseId")
+        app = ((c.get("checkSuite") or {}).get("app") or {}).get("slug") or ""
+        title = c.get("title") or ""
+        if c.get("status") != "COMPLETED":
+            return Check(name, "pending", (c.get("status") or "").lower(), url, run_id, app, title)
+        conclusion = c.get("conclusion") or ""
+        if conclusion in FAIL_STATES:
+            result = "fail"
+        elif conclusion in SKIP_STATES:
+            result = "skip"
+        else:
+            result = "pass"
+        return Check(name, result, conclusion.lower(), url, run_id, app, title)
+
+    state = c.get("state") or ""
+    if state in PENDING_STATES:
+        result = "pending"
+    elif state in FAIL_STATES:
+        result = "fail"
+    else:
+        result = "pass"
+    return Check(c.get("context") or "?", result, state.lower(), c.get("targetUrl") or "")
+
+
+def ci_summary(pr: PR) -> Tuple[str, str]:
+    """Returns (text, color name)."""
+    checks = pr.ci_checks
+    if not checks:
+        return "no checks", "dim"
+    total = max(pr.checks_total - (len(pr.checks) - len(checks)), len(checks))
+    pending = sum(c.result == "pending" for c in checks)
+    failed = sum(c.result == "fail" for c in checks)
+    if pending:
+        text = f"running {total - pending}/{total}"
+        if failed:
+            return f"{text} · {failed} failed", "red"
+        return text, "yellow"
+    if failed:
+        return f"done · {failed} failed", "red"
+    return "done · all passed", "green"
+
+
+def failed_runs(pr: PR) -> Tuple[List[int], List[int], int]:
+    """Returns (failed workflow runs that finished, failed runs still in progress,
+    count of failing checks that aren't GitHub Actions and can't be rerun from here)."""
+    by_run: Dict[int, List[Check]] = {}
+    other = 0
+    for c in pr.ci_checks:
+        if c.run_id is None:
+            other += c.result == "fail"
+        else:
+            by_run.setdefault(c.run_id, []).append(c)
+    ready, busy = [], []
+    for run_id, checks in by_run.items():
+        if any(c.result == "fail" for c in checks):
+            (busy if any(c.result == "pending" for c in checks) else ready).append(run_id)
+    return ready, busy, other
+
+
+def reviewer_status(pr: PR, login: str) -> Tuple[str, str, str]:
+    """Returns (symbol, label, color name) for a tracked reviewer on a PR."""
+    key = login.lower()
+    requested = key in {u.lower() for u in pr.requested_users}
+    opinion = pr.opinionated.get(key)
+    if requested:
+        if opinion == "APPROVED":
+            return "…", "waiting (re-requested, previously approved)", "yellow"
+        if opinion == "CHANGES_REQUESTED":
+            return "…", "waiting (re-requested after requesting changes)", "yellow"
+        return "…", "waiting", "yellow"
+    if opinion == "APPROVED":
+        return "✓", "approved", "green"
+    if opinion == "CHANGES_REQUESTED":
+        return "✗", "changes requested", "red"
+    if pr.latest.get(key) == "COMMENTED":
+        return "~", "commented (no approval yet)", "cyan"
+    return "…", "waiting (not requested on GitHub)", "yellow"
+
+
+def requested_on_github(pr: PR, login: str) -> bool:
+    return login.lower() in {u.lower() for u in pr.requested_users}
+
+
+def on_github(pr: PR, login: str) -> bool:
+    """Requested on GitHub or has already reviewed."""
+    return requested_on_github(pr, login) or login.lower() in pr.latest
+
+
+def is_approved(pr: PR, login: str) -> bool:
+    return not requested_on_github(pr, login) and pr.opinionated.get(login.lower()) == "APPROVED"
+
+
+def merge_blocker(pr: PR, tracked: List[str]) -> Optional[str]:
+    """Why the PR can't be merged yet, or None when all tracked reviewers approved and CI is green."""
+    if pr.state != "OPEN":
+        return "not open"
+    if pr.is_draft:
+        return "draft"
+    if not tracked:
+        return "no tracked reviewers"
+    approved = sum(is_approved(pr, l) for l in tracked)
+    if approved < len(tracked):
+        return f"approvals {approved}/{len(tracked)}"
+    if pr.mergeable == "CONFLICTING":
+        return "conflicts"
+    if any(c.result == "fail" for c in pr.ci_checks):
+        return "CI failed"
+    if any(c.result == "pending" for c in pr.ci_checks):
+        return "waiting on CI"
+    return None
+
+
+def ago(iso: Optional[str]) -> str:
+    if not iso:
+        return "-"
+    then = datetime.fromisoformat(iso.replace("Z", "+00:00"))
+    secs = int((datetime.now(timezone.utc) - then).total_seconds())
+    if secs < 60:
+        return f"{secs}s ago"
+    if secs < 3600:
+        return f"{secs // 60}m ago"
+    if secs < 86400:
+        return f"{secs // 3600}h ago"
+    return f"{secs // 86400}d ago"
+
+
+# ---------------------------------------------------------------------------
+# GitHub access (via gh CLI) and local storage
+# ---------------------------------------------------------------------------
+
+
+class GitHub:
+    def __init__(self, hostname: Optional[str], merged_days: int):
+        self.hostname = hostname
+        self.merged_days = merged_days
+
+    def _gh(self, args: List[str]) -> str:
+        if self.hostname and args[0] == "api":
+            args = args[:1] + ["--hostname", self.hostname] + args[1:]
+        proc = subprocess.run(["gh"] + args, capture_output=True, text=True)
+        if proc.returncode != 0:
+            lines = (proc.stderr or proc.stdout).strip().splitlines()
+            raise RuntimeError(lines[-1] if lines else "gh failed")
+        return proc.stdout
+
+    def fetch(self) -> Tuple[List[PR], List[PR]]:
+        since = (datetime.now(timezone.utc) - timedelta(days=self.merged_days)).strftime("%Y-%m-%d")
+        out = self._gh([
+            "api", "graphql",
+            "-f", f"query={QUERY}",
+            "-f", "open=is:pr is:open author:@me archived:false sort:updated-desc",
+            "-f", f"merged=is:pr is:merged author:@me merged:>={since} sort:updated-desc",
+        ])
+        data = json.loads(out)
+        if data.get("errors") and not data.get("data"):
+            raise RuntimeError(data["errors"][0].get("message", "GraphQL error"))
+        d = data["data"]
+        open_prs = [parse_pr(n) for n in d["open"]["nodes"] if n]
+        merged = [parse_pr(n) for n in d["merged"]["nodes"] if n]
+        merged.sort(key=lambda p: p.merged_at or "", reverse=True)
+        return open_prs, merged
+
+    def request_review(self, url: str, logins: List[str]) -> None:
+        self._gh(["pr", "edit", url, "--add-reviewer", ",".join(logins)])
+
+    def rerun_failed(self, repo: str, run_id: int) -> None:
+        if self.hostname:
+            repo = f"{self.hostname}/{repo}"
+        self._gh(["run", "rerun", str(run_id), "--failed", "-R", repo])
+
+    def merge(self, url: str, method: str) -> None:
+        # gh adds the PR to GitHub's merge queue instead when the base branch requires one.
+        self._gh(["pr", "merge", url, f"--{method.lower()}"])
+
+    def comment(self, url: str, body: str) -> None:
+        self._gh(["pr", "comment", url, "--body", body])
+
+
+MERGE_MODES = ("standard", "mergify")
+MERGIFY_QUEUE_COMMENT = "@mergifyio queue"
+
+
+class MergeStore:
+    """Per-PR "merge when approved" checkboxes, per-repo merge mode, and merge attempts."""
+
+    def __init__(self, path: str = MERGE_FILE):
+        self.path = path
+        self.data: Dict = {"auto": [], "modes": {}, "attempts": {}}
+        try:
+            with open(path) as f:
+                self.data.update(json.load(f))
+        except FileNotFoundError:
+            pass
+
+    def auto(self, url: str) -> bool:
+        return url in self.data["auto"]
+
+    def toggle_auto(self, url: str) -> bool:
+        if url in self.data["auto"]:
+            self.data["auto"].remove(url)
+        else:
+            self.data["auto"].append(url)
+        self._save()
+        return url in self.data["auto"]
+
+    def mode(self, pr: PR) -> str:
+        return self.data["modes"].get(pr.repo) or ("mergify" if pr.uses_mergify else "standard")
+
+    def set_mode(self, repo: str, mode: str) -> None:
+        self.data["modes"][repo] = mode
+        self._save()
+
+    def attempt(self, url: str) -> Optional[Dict]:
+        """Last merge/queue attempt: {"oid", "action", "error", "at"}."""
+        return self.data["attempts"].get(url)
+
+    def record_attempt(self, url: str, oid: str, action: str, error: Optional[str] = None) -> None:
+        self.data["attempts"][url] = {
+            "oid": oid, "action": action, "error": error,
+            "at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+        }
+        self._save()
+
+    def prune(self, open_urls: List[str]) -> None:
+        keep = set(open_urls)
+        before = json.dumps(self.data, sort_keys=True)
+        self.data["auto"] = [u for u in self.data["auto"] if u in keep]
+        self.data["attempts"] = {u: a for u, a in self.data["attempts"].items() if u in keep}
+        if json.dumps(self.data, sort_keys=True) != before:
+            self._save()
+
+    def _save(self) -> None:
+        write_json(self.path, self.data)
+
+
+class AutoRerunStore:
+    """PRs with auto-rerun enabled, and how many times each failed workflow run was retried."""
+
+    def __init__(self, path: str = AUTORERUN_FILE):
+        self.path = path
+        self.data: Dict = {"enabled": [], "retried": {}}
+        try:
+            with open(path) as f:
+                self.data.update(json.load(f))
+        except FileNotFoundError:
+            pass
+
+    def enabled(self, url: str) -> bool:
+        return url in self.data["enabled"]
+
+    def toggle(self, url: str) -> bool:
+        if url in self.data["enabled"]:
+            self.data["enabled"].remove(url)
+        else:
+            self.data["enabled"].append(url)
+        self._save()
+        return url in self.data["enabled"]
+
+    def retries(self, url: str, run_id: int) -> int:
+        return self.data["retried"].get(url, {}).get(str(run_id), 0)
+
+    def record_retry(self, url: str, run_id: int) -> None:
+        runs = self.data["retried"].setdefault(url, {})
+        runs[str(run_id)] = runs.get(str(run_id), 0) + 1
+        self._save()
+
+    def prune(self, open_urls: List[str]) -> None:
+        """Forget PRs that are no longer open."""
+        keep = set(open_urls)
+        before = json.dumps(self.data, sort_keys=True)
+        self.data["enabled"] = [u for u in self.data["enabled"] if u in keep]
+        self.data["retried"] = {u: r for u, r in self.data["retried"].items() if u in keep}
+        if json.dumps(self.data, sort_keys=True) != before:
+            self._save()
+
+    def _save(self) -> None:
+        write_json(self.path, self.data)
+
+
+class ReviewerStore:
+    """Maps PR URL -> list of tracked reviewer logins."""
+
+    def __init__(self, path: str = REVIEWERS_FILE):
+        self.path = path
+        self.data: Dict[str, List[str]] = {}
+        try:
+            with open(path) as f:
+                self.data = json.load(f)
+        except FileNotFoundError:
+            pass
+
+    def get(self, url: str) -> List[str]:
+        return self.data.get(url, [])
+
+    def add(self, url: str, logins: List[str]) -> None:
+        current = self.data.setdefault(url, [])
+        lower = {l.lower() for l in current}
+        for login in logins:
+            if login.lower() not in lower:
+                current.append(login)
+                lower.add(login.lower())
+        self._save()
+
+    def remove(self, url: str, logins: List[str]) -> List[str]:
+        drop = {l.lower() for l in logins}
+        before = self.data.get(url, [])
+        removed = [l for l in before if l.lower() in drop]
+        kept = [l for l in before if l.lower() not in drop]
+        if kept:
+            self.data[url] = kept
+        else:
+            self.data.pop(url, None)
+        self._save()
+        return removed
+
+    def _save(self) -> None:
+        write_json(self.path, self.data)
+
+
+def write_json(path: str, data) -> None:
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    tmp = path + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump(data, f, indent=2, sort_keys=True)
+    os.replace(tmp, path)
+
+
+def parse_logins(text: str) -> List[str]:
+    return [t.lstrip("@") for t in text.replace(",", " ").split() if t.lstrip("@")]
+
+
+# ---------------------------------------------------------------------------
+# Curses UI
+# ---------------------------------------------------------------------------
+
+COLOR_NAMES = ["green", "red", "yellow", "cyan", "magenta", "blue"]
+CHECK_SYMBOL = {"fail": ("✗", "red"), "pending": ("●", "yellow"), "pass": ("✓", "green"), "skip": ("-", "dim")}
+CHECK_ORDER = {"fail": 0, "pending": 1, "pass": 2, "skip": 3}
+STATE_COLOR = {"OPEN": "green", "DRAFT": "dim", "MERGED": "magenta", "CLOSED": "red"}
+
+COMMON_KEYS = (
+    "a/x add/untrack reviewer  f rerun failed  A auto-rerun  m merge now  M merge when approved  "
+    "T merge mode  o open  y copy url  r refresh"
+)
+HOME_KEYS = f"jk move  ⏎ details  {COMMON_KEYS}  q quit"
+DETAIL_KEYS = f"jk scroll  {COMMON_KEYS}  esc back"
+
+
+class App:
+    def __init__(self, scr, gh: GitHub, store: ReviewerStore, autorerun: AutoRerunStore,
+                 merge: MergeStore, interval: int):
+        self.scr = scr
+        self.gh = gh
+        self.store = store
+        self.autorerun = autorerun
+        self.merge = merge
+        self.interval = interval
+        self.next_refresh = 0.0
+        self.lock = threading.Lock()
+        self.open_prs: List[PR] = []
+        self.merged_prs: List[PR] = []
+        self.loaded = False
+        self.loading = False
+        self.error: Optional[str] = None
+        self.message = ""
+        self.message_at = 0.0
+        self.last_refresh = 0.0
+        self.sel = 0
+        self.home_scroll = 0
+        self.view = "home"
+        self.detail_url: Optional[str] = None
+        self.detail_scroll = 0
+        self.colors: Dict[str, int] = {}
+
+        curses.curs_set(0)
+        scr.keypad(True)
+        scr.timeout(250)
+        if curses.has_colors():
+            curses.start_color()
+            try:
+                curses.use_default_colors()
+                bg = -1
+            except curses.error:
+                bg = curses.COLOR_BLACK
+            for i, name in enumerate(COLOR_NAMES, start=1):
+                curses.init_pair(i, getattr(curses, f"COLOR_{name.upper()}"), bg)
+                self.colors[name] = curses.color_pair(i)
+        self.colors["dim"] = curses.A_DIM
+        self.colors[""] = 0
+
+    # -- state helpers ------------------------------------------------------
+
+    def all_prs(self) -> List[PR]:
+        return self.open_prs + self.merged_prs
+
+    def selected(self) -> Optional[PR]:
+        if self.view == "detail":
+            return next((p for p in self.all_prs() if p.url == self.detail_url), None)
+        prs = self.all_prs()
+        return prs[self.sel] if 0 <= self.sel < len(prs) else None
+
+    def flash(self, msg: str) -> None:
+        self.message = msg
+        self.message_at = time.time()
+
+    def refresh(self) -> None:
+        if self.loading:
+            return
+        self.loading = True
+
+        def work():
+            try:
+                open_prs, merged = self.gh.fetch()
+                with self.lock:
+                    current = self.selected()
+                    self.open_prs, self.merged_prs = open_prs, merged
+                    self.loaded = True
+                    self.error = None
+                    if current:
+                        urls = [p.url for p in self.all_prs()]
+                        if current.url in urls:
+                            self.sel = urls.index(current.url)
+                    self.sel = min(self.sel, max(0, len(self.all_prs()) - 1))
+                    self.autorerun.prune([p.url for p in open_prs])
+                    self.merge.prune([p.url for p in open_prs])
+                    to_rerun = self.plan_auto_reruns()
+                    to_merge = self.plan_auto_merges()
+                self.last_refresh = time.time()
+                self.next_refresh = self.last_refresh + self.interval
+                if to_rerun:
+                    self.run_reruns(to_rerun, auto=True)
+                if to_merge:
+                    self.run_merges(to_merge)
+            except Exception as e:  # surface any gh/network error in the footer
+                self.error = str(e)
+                self.last_refresh = time.time()
+                self.next_refresh = self.last_refresh + self.interval
+            finally:
+                self.loading = False
+
+        threading.Thread(target=work, daemon=True).start()
+
+    # -- CI reruns ----------------------------------------------------------
+
+    def plan_auto_reruns(self) -> List[Tuple[PR, int]]:
+        """Failed, finished workflow runs on auto-rerun PRs that still have retries left.
+        Retries are recorded up front so a slow GitHub update can't trigger a second one."""
+        plan = []
+        for pr in self.open_prs:
+            if not self.autorerun.enabled(pr.url):
+                continue
+            ready, _, _ = failed_runs(pr)
+            for run_id in ready:
+                if self.autorerun.retries(pr.url, run_id) < MAX_AUTO_RETRIES:
+                    self.autorerun.record_retry(pr.url, run_id)
+                    plan.append((pr, run_id))
+        return plan
+
+    def run_reruns(self, plan: List[Tuple[PR, int]], auto: bool) -> None:
+        errors, done = [], set()
+        for pr, run_id in plan:
+            try:
+                self.gh.rerun_failed(pr.repo, run_id)
+                done.add(pr.short_ref)
+            except Exception as e:
+                errors.append(f"{pr.short_ref} run {run_id}: {e}")
+        kind = "Auto-reran" if auto else "Reran"
+        if done:
+            self.flash(f"{kind} failed jobs on {', '.join(sorted(done))}")
+            self.next_refresh = time.time() + 5
+        if errors:
+            self.error = f"rerun failed: {'; '.join(errors)}"
+
+    def rerun_failed(self, pr: PR) -> None:
+        if pr.state != "OPEN":
+            self.flash("Only open PRs can be rerun")
+            return
+        ready, busy, other = failed_runs(pr)
+        notes = []
+        if busy:
+            notes.append(f"{len(busy)} failed workflow run(s) still in progress, rerun once they finish")
+        if other:
+            notes.append(f"{other} failing check(s) aren't GitHub Actions and can't be rerun here")
+        if not ready:
+            self.flash("; ".join(["No finished failed workflow runs to rerun"] + notes))
+            return
+        answer = self.prompt(f"Rerun failed jobs in {len(ready)} workflow run(s) on {pr.short_ref}? [y/N] ")
+        if not (answer or "").lower().startswith("y"):
+            return
+        self.flash(f"Rerunning failed jobs on {pr.short_ref}…" + (f" ({'; '.join(notes)})" if notes else ""))
+        plan = [(pr, run_id) for run_id in ready]
+        threading.Thread(target=self.run_reruns, args=(plan, False), daemon=True).start()
+
+    def toggle_autorerun(self, pr: PR) -> None:
+        if pr.state != "OPEN":
+            self.flash("Auto-rerun only applies to open PRs")
+            return
+        on = self.autorerun.toggle(pr.url)
+        if on:
+            self.flash(f"Auto-rerun on for {pr.short_ref} (max {MAX_AUTO_RETRIES} retry per failed workflow run)")
+            self.next_refresh = time.time()
+        else:
+            self.flash(f"Auto-rerun off for {pr.short_ref}")
+
+    # -- merging ------------------------------------------------------------
+
+    def tracked(self, pr: PR) -> List[str]:
+        """Tracked reviewers, limited to those who are reviewers on GitHub."""
+        return [l for l in self.store.get(pr.url) if on_github(pr, l)]
+
+    def in_queue(self, pr: PR) -> bool:
+        q = pr.mergify_queue
+        return bool(pr.merge_queue) or (q is not None and q.result in ("pending", "pass"))
+
+    def mode_label(self, pr: PR) -> str:
+        return "mergify" if self.merge.mode(pr) == "mergify" else pr.merge_method.lower()
+
+    def merge_status(self, pr: PR) -> Tuple[str, str]:
+        """Short merge/queue status with the merge-when-approved checkbox."""
+        box = "[x]" if self.merge.auto(pr.url) else "[ ]"
+        attempt = self.merge.attempt(pr.url)
+        if pr.merge_queue:
+            state, pos = pr.merge_queue
+            where = f"queue #{pos}" if pos else "in queue"
+            return f"{box} {where}: {state.lower().replace('_', ' ')}", "cyan"
+        q = pr.mergify_queue
+        if self.merge.mode(pr) == "mergify" and q and (q.result in ("pending", "fail") or attempt):
+            color = {"pending": "cyan", "fail": "red", "pass": "green"}.get(q.result, "yellow")
+            return f"{box} mergify: {q.title or q.detail}", color
+        if attempt and attempt["oid"] == pr.head_oid:
+            if attempt["error"]:
+                return f"{box} {attempt['action']} failed", "red"
+            return f"{box} {'queue requested' if attempt['action'] == 'queue' else 'merging…'}", "cyan"
+        if not self.merge.auto(pr.url):
+            return f"{box} {self.mode_label(pr)}", "dim"
+        blocker = merge_blocker(pr, self.tracked(pr))
+        if blocker is None:
+            return f"{box} ready to {self.mode_label(pr)}", "green"
+        return f"{box} {blocker}", "red" if blocker in ("CI failed", "conflicts") else "yellow"
+
+    def plan_auto_merges(self) -> List[Tuple[PR, str]]:
+        """Checked PRs that are ready. One attempt per head commit, recorded up front."""
+        plan = []
+        for pr in self.open_prs:
+            if not self.merge.auto(pr.url) or self.in_queue(pr):
+                continue
+            attempt = self.merge.attempt(pr.url)
+            if attempt and attempt["oid"] == pr.head_oid:
+                continue
+            if merge_blocker(pr, self.tracked(pr)) is None:
+                action = "queue" if self.merge.mode(pr) == "mergify" else "merge"
+                self.merge.record_attempt(pr.url, pr.head_oid, action)
+                plan.append((pr, action))
+        return plan
+
+    def run_merges(self, plan: List[Tuple[PR, str]]) -> None:
+        for pr, action in plan:
+            try:
+                if action == "queue":
+                    self.gh.comment(pr.url, MERGIFY_QUEUE_COMMENT)
+                    self.flash(f"Commented '{MERGIFY_QUEUE_COMMENT}' on {pr.short_ref}")
+                else:
+                    self.gh.merge(pr.url, pr.merge_method)
+                    self.flash(f"Merge requested for {pr.short_ref} ({pr.merge_method.lower()})")
+            except Exception as e:
+                with self.lock:
+                    self.merge.record_attempt(pr.url, pr.head_oid, action, str(e))
+                self.error = f"{action} {pr.short_ref} failed: {e}"
+        self.next_refresh = time.time() + 5
+
+    def merge_now(self, pr: PR) -> None:
+        if pr.state != "OPEN":
+            self.flash("Only open PRs can be merged")
+            return
+        mergify = self.merge.mode(pr) == "mergify"
+        blocker = merge_blocker(pr, self.tracked(pr))
+        what = f"Comment '{MERGIFY_QUEUE_COMMENT}' on" if mergify else f"{pr.merge_method.capitalize()}-merge"
+        warn = f" (not ready: {blocker})" if blocker else ""
+        answer = self.prompt(f"{what} {pr.short_ref} now{warn}? [y/N] ")
+        if not (answer or "").lower().startswith("y"):
+            return
+        action = "queue" if mergify else "merge"
+        self.merge.record_attempt(pr.url, pr.head_oid, action)
+        threading.Thread(target=self.run_merges, args=([(pr, action)],), daemon=True).start()
+
+    def toggle_automerge(self, pr: PR) -> None:
+        if pr.state != "OPEN":
+            self.flash("Merge-when-approved only applies to open PRs")
+            return
+        if self.merge.toggle_auto(pr.url):
+            how = "queue with Mergify" if self.merge.mode(pr) == "mergify" else f"{self.mode_label(pr)}-merge"
+            self.flash(f"Will {how} {pr.short_ref} once all tracked reviewers approve and CI passes")
+            self.next_refresh = time.time()
+        else:
+            self.flash(f"Merge-when-approved off for {pr.short_ref}")
+
+    def switch_merge_mode(self, pr: PR) -> None:
+        mode = MERGE_MODES[(MERGE_MODES.index(self.merge.mode(pr)) + 1) % len(MERGE_MODES)]
+        self.merge.set_mode(pr.repo, mode)
+        self.flash(f"Merge mode for {pr.repo}: {mode}")
+
+    # -- drawing primitives -------------------------------------------------
+
+    def put(self, y: int, x: int, text: str, color: str = "", attr: int = 0, width: Optional[int] = None) -> int:
+        h, w = self.scr.getmaxyx()
+        if y >= h or x >= w:
+            return x
+        limit = w - x - (1 if y == h - 1 else 0)
+        if width is not None:
+            limit = min(limit, width)
+        if limit <= 0:
+            return x
+        if len(text) > limit:
+            text = text[: max(0, limit - 1)] + "…" if limit > 1 else text[:limit]
+        try:
+            self.scr.addstr(y, x, text, self.colors.get(color, 0) | attr)
+        except curses.error:
+            pass
+        return x + len(text)
+
+    def draw_header(self, title: str) -> None:
+        _, w = self.scr.getmaxyx()
+        self.scr.attron(curses.A_REVERSE)
+        self.put(0, 0, " " * w)
+        x = self.put(0, 1, title, attr=curses.A_REVERSE | curses.A_BOLD)
+        status = []
+        if self.loading:
+            status.append("refreshing…")
+        elif self.last_refresh:
+            status.append(f"updated {ago(datetime.fromtimestamp(self.last_refresh, timezone.utc).isoformat())}")
+        right = "  ".join(status) + " "
+        self.put(0, max(x + 2, w - len(right)), right, attr=curses.A_REVERSE)
+        self.scr.attroff(curses.A_REVERSE)
+
+    def draw_footer(self, keys: str) -> None:
+        h, _ = self.scr.getmaxyx()
+        if self.error:
+            self.put(h - 2, 1, f"error: {self.error}", "red")
+        elif self.message and time.time() - self.message_at < 6:
+            self.put(h - 2, 1, self.message, "cyan")
+        self.put(h - 1, 1, keys, "dim")
+
+    # -- home view ----------------------------------------------------------
+
+    def draw_home(self) -> None:
+        h, w = self.scr.getmaxyx()
+        self.draw_header(f"prmon · {len(self.open_prs)} open · {len(self.merged_prs)} merged in {self.gh.merged_days}d")
+
+        if not self.loaded:
+            self.put(2, 2, "Loading pull requests…" if not self.error else "Could not load pull requests.")
+            self.draw_footer(HOME_KEYS)
+            return
+
+        # Build display lines: ("section", text) or ("pr", index)
+        lines: List[Tuple[str, object]] = [("section", f"OPEN ({len(self.open_prs)})")]
+        if not self.open_prs:
+            lines.append(("empty", "  no open pull requests"))
+        lines += [("pr", i) for i in range(len(self.open_prs))]
+        lines.append(("blank", ""))
+        lines.append(("section", f"MERGED · last {self.gh.merged_days} days ({len(self.merged_prs)})"))
+        if not self.merged_prs:
+            lines.append(("empty", "  nothing merged recently"))
+        lines += [("pr", len(self.open_prs) + i) for i in range(len(self.merged_prs))]
+
+        body_top, body_h = 2, max(1, h - 5)
+        sel_line = next((n for n, (k, v) in enumerate(lines) if k == "pr" and v == self.sel), 0)
+        if sel_line < self.home_scroll:
+            self.home_scroll = max(0, sel_line - 1)
+        elif sel_line >= self.home_scroll + body_h:
+            self.home_scroll = sel_line - body_h + 1
+
+        prs = self.all_prs()
+        ref_w = min(30, max([len(p.short_ref) for p in prs] + [6]))
+        ci_w = 30
+        merge_w = 30
+        fixed = 2 + 7 + ref_w + 1 + ci_w + 1 + merge_w + 2
+        title_w = max(10, min(60, (w - fixed) // 2))
+        rev_w = max(20, w - fixed - title_w - 1)
+        widths = (ref_w, title_w, ci_w, merge_w, rev_w)
+
+        for row, (kind, value) in enumerate(lines[self.home_scroll : self.home_scroll + body_h]):
+            y = body_top + row
+            if kind == "section":
+                self.put(y, 1, value, attr=curses.A_BOLD | curses.A_UNDERLINE)
+            elif kind == "empty":
+                self.put(y, 1, value, "dim")
+            elif kind == "pr":
+                self.draw_pr_row(y, prs[value], value == self.sel, *widths)
+
+        self.draw_footer(HOME_KEYS)
+
+    def draw_pr_row(self, y: int, pr: PR, selected: bool, ref_w: int, title_w: int, ci_w: int,
+                    merge_w: int, rev_w: int) -> None:
+        _, w = self.scr.getmaxyx()
+        base = curses.A_REVERSE if selected else 0
+        if selected:
+            self.put(y, 0, " " * (w - 1), attr=base)
+        x = self.put(y, 0, "▶ " if selected else "  ", attr=base)
+        label = pr.state_label
+        x = self.put(y, x, f"{label:<7}", STATE_COLOR.get(label, ""), base | curses.A_BOLD)
+        x = self.put(y, x, f"{pr.short_ref:<{ref_w}} ", attr=base, width=ref_w + 1)
+        x = self.put(y, x, f"{pr.title:<{title_w}}", attr=base, width=title_w)
+        x += 1
+
+        if pr.state == "OPEN":
+            ci_text, ci_color = ci_summary(pr)
+            if pr.mergeable == "CONFLICTING":
+                ci_text += " · conflict"
+                ci_color = "red"
+            if self.autorerun.enabled(pr.url):
+                ci_text = "↻ " + ci_text
+        else:
+            ci_text, ci_color = f"merged {ago(pr.merged_at)}", "magenta"
+        self.put(y, x, f"{ci_text:<{ci_w}}", ci_color, base, width=ci_w)
+        x += ci_w + 1
+        if pr.state == "OPEN":
+            merge_text, merge_color = self.merge_status(pr)
+            self.put(y, x, f"{merge_text:<{merge_w}}", merge_color, base, width=merge_w)
+        x += merge_w + 1
+
+        tracked = self.tracked(pr)
+        if not tracked:
+            self.put(y, x, "no reviewers tracked", "dim", base, width=rev_w)
+            return
+        end = x + rev_w
+        for login in tracked:
+            sym, _, color = reviewer_status(pr, login)
+            chunk = f"{sym}{login} "
+            if x + len(chunk) > end:
+                self.put(y, x, "…", attr=base)
+                break
+            x = self.put(y, x, chunk, color, base)
+
+    # -- detail view --------------------------------------------------------
+
+    def detail_lines(self, pr: PR, width: int) -> List[List[Tuple[str, str, int]]]:
+        """Each line is a list of (text, color, attr) segments."""
+        L: List[List[Tuple[str, str, int]]] = []
+        add = L.append
+        bold = curses.A_BOLD
+
+        for chunk in textwrap.wrap(pr.title, width) or [""]:
+            add([(chunk, "", bold)])
+        label = pr.state_label
+        add([(f"{pr.repo}#{pr.number}  ", "", 0), (label, STATE_COLOR.get(label, ""), bold)])
+        add([(pr.url, "blue", 0)])
+        add([(f"{pr.head} → {pr.base}", "dim", 0)])
+        mergeable = {"MERGEABLE": ("no conflicts", "green"), "CONFLICTING": ("has conflicts", "red")}.get(
+            pr.mergeable, ("mergeability unknown", "dim")
+        )
+        add([
+            (f"+{pr.additions}", "green", 0), (" ", "", 0), (f"-{pr.deletions}", "red", 0),
+            (f"  {pr.changed_files} files  ·  ", "", 0), mergeable + (0,),
+        ])
+        times = f"created {ago(pr.created_at)}  ·  updated {ago(pr.updated_at)}"
+        if pr.merged_at:
+            times += f"  ·  merged {ago(pr.merged_at)}"
+        add([(times, "dim", 0)])
+        decision = {
+            "APPROVED": ("approved", "green"),
+            "CHANGES_REQUESTED": ("changes requested", "red"),
+            "REVIEW_REQUIRED": ("review required", "yellow"),
+        }.get(pr.review_decision or "", ("none", "dim"))
+        add([("Review decision: ", "", 0), decision + (0,)])
+        add([])
+
+        add([("Tracked reviewers", "", bold | curses.A_UNDERLINE)])
+        tracked = self.tracked(pr)
+        if not tracked:
+            add([("  none yet (press a to add one; it also requests their review on GitHub)", "dim", 0)])
+        tracked_lower = {t.lower() for t in tracked}
+        others = []
+        for key in sorted(set(pr.latest) | {u.lower() for u in pr.requested_users}):
+            if key not in tracked_lower:
+                others.append(pr.login_case.get(key, key))
+        name_w = max([len(n) for n in tracked + others + ["team:" + t for t in pr.requested_teams]] + [12]) + 2
+
+        for login in tracked:
+            sym, text, color = reviewer_status(pr, login)
+            add([(f"  {sym} ", color, bold), (f"{login:<{name_w}}", "", 0), (text, color, 0)])
+        if others or pr.requested_teams:
+            add([])
+            add([("Other reviewers on GitHub", "", bold | curses.A_UNDERLINE)])
+            for login in others:
+                sym, text, color = reviewer_status(pr, login)
+                if text.startswith("waiting (not requested"):
+                    text = "reviewed"
+                add([(f"  {sym} ", color, bold), (f"{login:<{name_w}}", "", 0), (text, color, 0)])
+            for team in pr.requested_teams:
+                add([("  … ", "yellow", bold), (f"{'team:' + team:<{name_w}}", "", 0), ("waiting", "yellow", 0)])
+        add([])
+
+        if pr.state == "OPEN":
+            add([("Merge", "", bold | curses.A_UNDERLINE)])
+            status, color = self.merge_status(pr)
+            add([("  ", "", 0), (status, color, bold)])
+            auto = self.merge.auto(pr.url)
+            add([(f"  {'[x]' if auto else '[ ]'} merge when all tracked reviewers approve and CI passes", "", 0),
+                 ("  (M to toggle, m to merge now)", "dim", 0)])
+            mode = self.merge.mode(pr)
+            how = f"comment '{MERGIFY_QUEUE_COMMENT}'" if mode == "mergify" else f"gh pr merge --{pr.merge_method.lower()}"
+            add([(f"  mode: {mode}", "", 0), (f" · {how} (T to switch for {pr.repo})", "dim", 0)])
+            blocker = merge_blocker(pr, tracked)
+            add([("  readiness: ", "", 0), ("ready", "green", 0) if blocker is None else (blocker, "yellow", 0)])
+            if pr.merge_queue:
+                state, pos = pr.merge_queue
+                add([(f"  GitHub merge queue: position {pos or '?'}, {state.lower().replace('_', ' ')}", "cyan", 0)])
+            for c in pr.checks:
+                if c.is_mergify:
+                    sym, ccolor = CHECK_SYMBOL[c.result]
+                    add([(f"  {sym} ", ccolor, bold), (f"Mergify / {c.name}", "", 0),
+                         (f"  {c.title or c.detail}", "dim", 0)])
+            attempt = self.merge.attempt(pr.url)
+            if attempt:
+                stale = "" if attempt["oid"] == pr.head_oid else " (older commit)"
+                what = "queue" if attempt["action"] == "queue" else "merge"
+                text = f"  last {what} attempt {ago(attempt['at'])}{stale}"
+                add([(text, "dim", 0)] + ([(f"  error: {attempt['error']}", "red", 0)] if attempt["error"] else []))
+            add([])
+
+        ci_text, ci_color = ci_summary(pr)
+        add([("Checks  ", "", bold | curses.A_UNDERLINE), (ci_text, ci_color, 0)])
+        if pr.state == "OPEN":
+            if self.autorerun.enabled(pr.url):
+                add([("  ↻ auto-rerun on", "cyan", 0),
+                     (f" · failed workflow runs are retried up to {MAX_AUTO_RETRIES}x (A to turn off)", "dim", 0)])
+            else:
+                add([("  auto-rerun off (A to turn on, f to rerun failed jobs now)", "dim", 0)])
+        for c in sorted(pr.ci_checks, key=lambda c: (CHECK_ORDER[c.result], c.name.lower())):
+            sym, color = CHECK_SYMBOL[c.result]
+            segs = [(f"  {sym} ", color, bold), (c.name, "", 0), (f"  {c.detail}", "dim", 0)]
+            retried = self.autorerun.retries(pr.url, c.run_id) if c.run_id else 0
+            if retried and c.result in ("fail", "pending"):
+                segs.append((f"  (auto-retried {retried}/{MAX_AUTO_RETRIES})", "cyan", 0))
+            if c.result == "fail" and c.run_id is None:
+                segs.append(("  (not GitHub Actions, can't rerun)", "dim", 0))
+            add(segs)
+            if c.result == "fail" and c.url:
+                add([(f"      {c.url}", "blue", 0)])
+        if pr.checks_total > len(pr.checks):
+            add([(f"  … {pr.checks_total - len(pr.checks)} more checks not shown", "dim", 0)])
+        add([])
+
+        add([("Description", "", bold | curses.A_UNDERLINE)])
+        body = pr.body.replace("\r\n", "\n").strip()
+        if not body:
+            add([("  (empty)", "dim", 0)])
+        for para in body.split("\n"):
+            for chunk in textwrap.wrap(para, max(10, width - 2)) or [""]:
+                add([("  " + chunk, "", 0)])
+        return L
+
+    def draw_detail(self) -> None:
+        h, w = self.scr.getmaxyx()
+        pr = self.selected()
+        if not pr:
+            self.view = "home"
+            return
+        self.draw_header(f"prmon · {pr.short_ref}")
+        lines = self.detail_lines(pr, w - 4)
+        body_h = max(1, h - 4)
+        self.detail_scroll = max(0, min(self.detail_scroll, len(lines) - body_h))
+        for row, segs in enumerate(lines[self.detail_scroll : self.detail_scroll + body_h]):
+            x = 2
+            for text, color, attr in segs:
+                x = self.put(2 + row, x, text, color, attr)
+        self.draw_footer(DETAIL_KEYS)
+
+    # -- input --------------------------------------------------------------
+
+    def prompt(self, label: str) -> Optional[str]:
+        h, w = self.scr.getmaxyx()
+        curses.curs_set(1)
+        self.scr.timeout(-1)
+        buf = ""
+        try:
+            while True:
+                self.put(h - 2, 0, " " * (w - 1))
+                x = self.put(h - 2, 1, label, "cyan", curses.A_BOLD)
+                self.put(h - 2, x, buf)
+                self.scr.move(h - 2, min(w - 2, x + len(buf)))
+                ch = self.scr.get_wch()
+                if ch in ("\n", "\r") or ch == curses.KEY_ENTER:
+                    return buf.strip()
+                if ch == "\x1b":
+                    return None
+                if ch in (curses.KEY_BACKSPACE, "\x7f", "\b"):
+                    buf = buf[:-1]
+                elif ch == "\x15":  # ctrl-u
+                    buf = ""
+                elif isinstance(ch, str) and ch.isprintable():
+                    buf += ch
+        finally:
+            curses.curs_set(0)
+            self.scr.timeout(250)
+
+    def add_reviewers(self, pr: PR) -> None:
+        if pr.state != "OPEN":
+            self.flash("Reviewers can only be added to open PRs")
+            return
+        text = self.prompt(f"Add reviewer(s) to {pr.short_ref} (also requests review on GitHub): ")
+        logins = parse_logins(text or "")
+        if not logins:
+            return
+        already = [l for l in logins if on_github(pr, l)]
+        missing = [l for l in logins if not on_github(pr, l)]
+        if already:
+            self.store.add(pr.url, already)
+            self.flash(f"Tracking {', '.join(already)} (already reviewers on GitHub)")
+        if not missing:
+            return
+        self.flash(f"Requesting review from {', '.join(missing)}…")
+
+        def work():
+            try:
+                self.gh.request_review(pr.url, missing)
+            except Exception as e:
+                self.error = f"couldn't request review from {', '.join(missing)}, not tracking them: {e}"
+                return
+            with self.lock:
+                self.store.add(pr.url, missing)
+            self.flash(f"Requested review from {', '.join(missing)} on {pr.short_ref}")
+            self.next_refresh = time.time()
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def remove_reviewers(self, pr: PR) -> None:
+        tracked = self.tracked(pr)
+        if not tracked:
+            self.flash("No tracked reviewers on this PR")
+            return
+        text = self.prompt(f"Stop tracking ({', '.join(tracked)}): ")
+        logins = parse_logins(text or "")
+        if logins:
+            removed = self.store.remove(pr.url, logins)
+            self.flash(f"Removed {', '.join(removed)}" if removed else "No matching reviewers")
+
+    def open_url(self, pr: PR) -> None:
+        has_gui = sys.platform in ("darwin", "win32") or os.environ.get("DISPLAY") or os.environ.get("WAYLAND_DISPLAY")
+        if has_gui:
+            try:
+                subprocess.Popen(
+                    [sys.executable, "-c", "import sys, webbrowser; webbrowser.open(sys.argv[1])", pr.url],
+                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True,
+                )
+                self.flash(f"Opened {pr.url}")
+                return
+            except OSError:
+                pass
+        self.copy_url(pr, prefix="No browser here; ")
+
+    def copy_url(self, pr: PR, prefix: str = "") -> None:
+        # OSC 52 asks the terminal emulator to set the clipboard; works over SSH and in tmux
+        # with `set -g set-clipboard on`.
+        seq = f"\033]52;c;{base64.b64encode(pr.url.encode()).decode()}\a"
+        if os.environ.get("TMUX"):
+            seq = f"\033Ptmux;\033{seq}\033\\"
+        sys.stdout.write(seq)
+        sys.stdout.flush()
+        self.flash(f"{prefix}copied {pr.url}")
+
+    def handle_key(self, ch) -> bool:
+        """Returns False to quit."""
+        n = len(self.all_prs())
+        pr = self.selected()
+        h, _ = self.scr.getmaxyx()
+
+        if ch == "r":
+            self.refresh()
+        elif ch == "f" and pr:
+            self.rerun_failed(pr)
+        elif ch == "A" and pr:
+            self.toggle_autorerun(pr)
+        elif ch == "m" and pr:
+            self.merge_now(pr)
+        elif ch == "M" and pr:
+            self.toggle_automerge(pr)
+        elif ch == "T" and pr:
+            self.switch_merge_mode(pr)
+        elif ch == "a" and pr:
+            self.add_reviewers(pr)
+        elif ch == "x" and pr:
+            self.remove_reviewers(pr)
+        elif ch == "o" and pr:
+            self.open_url(pr)
+        elif ch == "y" and pr:
+            self.copy_url(pr)
+        elif self.view == "home":
+            if ch in ("q", "Q"):
+                return False
+            if ch in ("j", curses.KEY_DOWN) and n:
+                self.sel = min(n - 1, self.sel + 1)
+            elif ch in ("k", curses.KEY_UP) and n:
+                self.sel = max(0, self.sel - 1)
+            elif ch in ("g", curses.KEY_HOME):
+                self.sel = 0
+            elif ch in ("G", curses.KEY_END) and n:
+                self.sel = n - 1
+            elif ch in ("\n", "\r", "l", curses.KEY_ENTER, curses.KEY_RIGHT) and pr:
+                self.view, self.detail_url, self.detail_scroll = "detail", pr.url, 0
+        else:
+            if ch in ("q", "\x1b", "h", curses.KEY_LEFT, curses.KEY_BACKSPACE, "\x7f"):
+                self.view = "home"
+            elif ch in ("j", curses.KEY_DOWN):
+                self.detail_scroll += 1
+            elif ch in ("k", curses.KEY_UP):
+                self.detail_scroll = max(0, self.detail_scroll - 1)
+            elif ch in (" ", curses.KEY_NPAGE, "\x04"):
+                self.detail_scroll += max(1, h // 2)
+            elif ch in (curses.KEY_PPAGE, "\x15"):
+                self.detail_scroll = max(0, self.detail_scroll - max(1, h // 2))
+            elif ch in ("g", curses.KEY_HOME):
+                self.detail_scroll = 0
+            elif ch in ("G", curses.KEY_END):
+                self.detail_scroll = 10**6
+        return True
+
+    def run(self) -> None:
+        self.refresh()
+        while True:
+            if not self.loading and self.last_refresh and time.time() >= self.next_refresh:
+                self.refresh()
+            with self.lock:
+                self.scr.erase()
+                if self.view == "detail":
+                    self.draw_detail()
+                if self.view == "home":
+                    self.draw_home()
+                self.scr.refresh()
+            try:
+                ch = self.scr.get_wch()
+            except curses.error:
+                continue
+            if ch == curses.KEY_RESIZE:
+                continue
+            with self.lock:
+                if not self.handle_key(ch):
+                    return
+
+
+# ---------------------------------------------------------------------------
+# Plain-text mode and entry point
+# ---------------------------------------------------------------------------
+
+
+def print_once(gh: GitHub, store: ReviewerStore) -> None:
+    open_prs, merged = gh.fetch()
+
+    def row(pr: PR, status: str) -> str:
+        tracked = [l for l in store.get(pr.url) if on_github(pr, l)]
+        revs = " ".join(f"{reviewer_status(pr, l)[0]}{l}" for l in tracked) or "-"
+        return f"  {pr.state_label:<7} {pr.short_ref:<28} {pr.title[:50]:<50}  {status:<24} {revs}"
+
+    print(f"OPEN ({len(open_prs)})")
+    for pr in open_prs:
+        print(row(pr, ci_summary(pr)[0]))
+    print(f"\nMERGED · last {gh.merged_days} days ({len(merged)})")
+    for pr in merged:
+        print(row(pr, f"merged {ago(pr.merged_at)}"))
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description="Terminal dashboard for your GitHub pull requests.")
+    parser.add_argument("--days", type=int, default=7, help="show PRs merged in the last N days (default 7)")
+    parser.add_argument("--interval", type=int, default=60, help="auto-refresh interval in seconds (default 60)")
+    parser.add_argument("--hostname", default=os.environ.get("GH_HOST"), help="GitHub host (for GitHub Enterprise)")
+    parser.add_argument("--once", action="store_true", help="print a plain-text summary and exit")
+    args = parser.parse_args()
+
+    if not shutil.which("gh"):
+        print("prmon needs the GitHub CLI: https://cli.github.com (then run `gh auth login`)", file=sys.stderr)
+        return 1
+
+    gh = GitHub(args.hostname, args.days)
+    store = ReviewerStore()
+    if args.once:
+        try:
+            print_once(gh, store)
+        except RuntimeError as e:
+            print(f"error: {e}", file=sys.stderr)
+            return 1
+        return 0
+
+    locale.setlocale(locale.LC_ALL, "")
+    os.environ.setdefault("ESCDELAY", "25")
+    autorerun = AutoRerunStore()
+    merge = MergeStore()
+    curses.wrapper(lambda scr: App(scr, gh, store, autorerun, merge, max(10, args.interval)).run())
+    return 0
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main())
+    except KeyboardInterrupt:
+        sys.exit(130)

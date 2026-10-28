@@ -1,10 +1,3 @@
-# Enable Powerlevel10k instant prompt. Should stay close to the top of ~/.zshrc.
-# Initialization code that may require console input (password prompts, [y/n]
-# confirmations, etc.) must go above this block; everything else may go below.
-if [[ -r "${XDG_CACHE_HOME:-$HOME/.cache}/p10k-instant-prompt-${(%):-%n}.zsh" ]]; then
-  source "${XDG_CACHE_HOME:-$HOME/.cache}/p10k-instant-prompt-${(%):-%n}.zsh"
-fi
-
 if [[ -f "/opt/homebrew/bin/brew" ]] then
   # If you're using macOS, you'll want this enabled
   eval "$(/opt/homebrew/bin/brew shellenv)"
@@ -76,6 +69,9 @@ zstyle ':completion:*' menu no
 zstyle ':fzf-tab:complete:cd:*' fzf-preview 'ls --color $realpath'
 zstyle ':fzf-tab:complete:__zoxide_z:*' fzf-preview 'ls --color $realpath'
 
+# Scripts
+export PATH="$HOME/.dotfiles/bin:$PATH"
+
 # Aliases
 alias ls='ls --color'
 alias vim='nvim'
@@ -84,10 +80,11 @@ alias c='clear'
 alias ll='ls -la --color'
 alias la='ls -a --color'
 alias git-clean-branches='git branch --merged main | grep -v "\*" | grep -v "main" | xargs -n 1 git branch -d'
+alias gp='git pull origin main --recurse-submodules'
 
 bindkey '^f' autosuggest-accept
 bindkey '^I' expand-or-complete # use fzf-tab for tab behavior
 
 # Shell integrations
-eval "$(fzf --zsh)" # enable for new versions of fzf
+source <(fzf --zsh)
 eval "$(zoxide init --cmd cd zsh)"
